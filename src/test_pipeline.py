@@ -43,11 +43,11 @@ LAUNCH_MAP = "c2m1_highway"
 
 SERVER_BOOT_TIMEOUT = 120
 STATE_TIMEOUT = 20
-SURVIVOR_SPAWN_TIMEOUT = 60
+SURVIVOR_SPAWN_TIMEOUT = 120 
 DECISION_INTERVAL = 5
-EPISODE_MAX_TIME = 120
+EPISODE_MAX_TIME = 500
 
-MIN_SURVIVORS = 2
+MIN_SURVIVORS = 3 
 TARGET_SURVIVORS = 4
 
 # ============================================================
@@ -212,7 +212,7 @@ class L4D2DirectorEnv(gym.Env):
         self._send_rcon(f'sm_cvar l4d2_directoroptions_overwrite "{overwrite}"')
 
     def _automate_human_kickstart(self):
-        """Launches the game and aggressively forces focus to dismiss the VAC warning/MOTD."""
+        """Launches the game, dismisses MOTD, and physically walks the human forward."""
         print("[Env] Launching retail L4D2 client...")
         
         client_cmd = [
@@ -221,8 +221,7 @@ class L4D2DirectorEnv(gym.Env):
             "-window",
             "-novid",
             "-nomotd",             
-            "+connect", f"{LAN_IP}:27015",
-            "+forward" # Auto-walk when spawned
+            "+connect", f"{LAN_IP}:27015"
         ]
         subprocess.Popen(client_cmd, cwd=STEAM_DIR)
         
@@ -235,15 +234,17 @@ class L4D2DirectorEnv(gym.Env):
                 win = l4d2_windows[0]
                 win.activate()
                 time.sleep(1)
-                # Force focus by clicking center
                 pyautogui.click(pyautogui.size()[0] // 2, pyautogui.size()[1] // 2)
                 time.sleep(1)
-                # Spam Enter and Space to clear VAC and MOTD
-                print("[Env] Spamming Enter/Space to bypass prompts...")
-                for _ in range(6):
+                print("[Env] Spamming keys to bypass prompts and MOTD...")
+                for _ in range(4):
                     pyautogui.press('enter')
                     time.sleep(0.5)
                     pyautogui.press('space')
+                    time.sleep(0.5)
+                    pyautogui.press('esc')
+                    time.sleep(0.5)
+                    pyautogui.press('h') 
                     time.sleep(0.5)
         except Exception as e:
             print(f"[Env] Automation error: {e}")
@@ -294,17 +295,28 @@ class L4D2DirectorEnv(gym.Env):
                 time.sleep(2)
 
             if human_spawned:
-                print("[Env] ✅ Human connected! Waiting 10s for +forward to walk them...")
-                time.sleep(10) 
+                print("[Env] ✅ Human connected! Waiting 15s for intro to finish...")
+                time.sleep(15) 
                 
-                print("[Env] Teleporting team forward to trigger L4B2...")
-                c.run("warp_all_survivors_to_checkpoint")
-                time.sleep(5) 
+                # THE FIX: Physically hold W to walk the human out of the safe room
+                print("[Env] Physically holding 'W' to walk the human out...")
+                try:
+                    l4d2_windows = gw.getWindowsWithTitle("Left 4 Dead 2")
+                    if l4d2_windows:
+                        l4d2_windows[0].activate()
+                        time.sleep(1)
+                    pyautogui.keyDown('w')
+                    time.sleep(4) # Hold W for 4 seconds
+                    pyautogui.keyUp('w')
+                    print("[Env] Movement complete. Triggering L4B2 lead...")
+                    c.run("scripted_user_func l4b,bots,lead")
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"[Env] Walk automation failed: {e}")
             else:
                 print("[Env] ❌ Human never connected in time.")
 
             # 4. Use SourceMod plugin to move the human to Spectator mode. 
-            #    This keeps their body on the map as a permanent bot!
             print("[Env] Moving human to Spectator mode (keeping bot body)...")
             c.run("sm_rl_human2spec") 
             time.sleep(5)
@@ -351,7 +363,7 @@ class L4D2DirectorEnv(gym.Env):
 
         print("\n[DEBUG] Failed to detect bots. Printing relevant console logs:")
         print_console_log()
-        raise RuntimeError("Failed to spawn bots after 60s.")
+        raise RuntimeError("Failed to spawn bots after 120s.")
 
     def _check_bot_movement(self, state):
         avg_x = sum(s["x"] for s in state["survivors"]) / max(1, len(state["survivors"]))
@@ -364,6 +376,7 @@ class L4D2DirectorEnv(gym.Env):
 
         if self.stuck_counter >= 3:
             print("[Env] 🚨 BOTS ARE STUCK (no movement for 3 steps).")
+            # L4B2 natively handles this
             self._send_rcon("scripted_user_func l4b,bots,lead")
             self.stuck_counter = 0
 
@@ -416,16 +429,7 @@ class L4D2DirectorEnv(gym.Env):
         self.reader.open()
         state = self._spawn_bots()
 
-        print("[Env] Unfreezing bots and setting leading cvars...")
-        self._send_rcon("sm_cvar nb_stop 0")
-        self._send_rcon("sm_cvar sb_stop 0")
-        self._send_rcon("sm_cvar sb_all_bot_game 1")
-        self._send_rcon("sm_cvar allow_all_bot_survivor_team 1")
-        self._send_rcon("sm_cvar sb_move 0")
-        self._send_rcon("sm_cvar sb_allow_leading 1")
-        self._send_rcon("sm_cvar sb_unstick 1")
-
-        time.sleep(5)
+        # NOTE: Removed the conflicting vanilla cvars here. L4B2 handles the AI.
 
         self.start_time = time.monotonic()
         self.prev_state = state
