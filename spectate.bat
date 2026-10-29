@@ -1,0 +1,1 @@
+start left4dead2.exe -insecure -console -novid +connect 127.0.0.1:27015

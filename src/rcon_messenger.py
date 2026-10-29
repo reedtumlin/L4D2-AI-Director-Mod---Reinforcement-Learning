@@ -2,7 +2,7 @@
 
 from rcon.source import Client
 
-RCON_HOST = "192.168.0.153"
+RCON_HOST = "192.168.0.2"
 RCON_PORT = 27015
 RCON_PASSWORD = "reed1"
 
