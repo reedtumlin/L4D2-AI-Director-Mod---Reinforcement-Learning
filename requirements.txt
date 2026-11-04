@@ -1,0 +1,8 @@
+# Python 3.13. Install with:  python -m pip install -r requirements.txt
+gymnasium==1.4.0
+numpy==2.5.4
+rcon==2.4.9
+sb3_contrib==2.9.0
+stable_baselines3==2.9.0
+tensorboard==2.21.0
+torch==2.14.1

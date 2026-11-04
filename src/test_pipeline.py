@@ -4,6 +4,7 @@ Trains a PPO agent to control the Director on c2m1_highway.
 """
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -12,7 +13,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from rcon.source import Client
-from stable_baselines3 import PPO
+
+import director_logic as dl
 
 # ============================================================
 # CONFIGURATION
@@ -42,10 +44,14 @@ TIMESCALE = 8.0
 
 # Both measured in GAME seconds, so they mean the same thing at any TIMESCALE.
 DECISION_INTERVAL = 5
-EPISODE_MAX_TIME = 300
+EPISODE_MAX_TIME = 1000
+MAX_STEPS = EPISODE_MAX_TIME // DECISION_INTERVAL
 
 # Furthest-survivor flow / map max flow at which the map counts as completed.
 PROGRESS_COMPLETE = 0.99
+# If the map reloads on its own, the team finished it if they were this far along;
+# otherwise it was a mission-lost restart (everyone went down).
+MAP_CHANGE_COMPLETE_PROGRESS = 0.90
 
 MIN_SURVIVORS = 3 
 TARGET_SURVIVORS = 4
@@ -202,11 +208,15 @@ class StateReader:
 class L4D2DirectorEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self):
+    def __init__(self, verbose=True):
         super().__init__()
-        self.action_space = spaces.MultiDiscrete([4, 4, 4, 4])
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25,), dtype=np.float32)
+        self.verbose = verbose
+        # [SI pressure 0-4, common pressure 0-3, event none/horde/witch/tank] -- see director_logic.py
+        self.action_space = spaces.MultiDiscrete(dl.ACTION_NVEC)
+        self.observation_space = spaces.Box(low=-1.0, high=1.5, shape=(dl.OBS_SIZE,), dtype=np.float32)
 
+        self.tracker = None
+        self.last_overwrite = None
         self.server = None
         self.client = None
         self.reader = None
@@ -217,17 +227,19 @@ class L4D2DirectorEnv(gym.Env):
         self.stuck_counter = 0
         self.last_game_time = None
 
+    def action_masks(self):
+        """Legal actions for the next step (called by MaskablePPO before each action).
+
+        Based on the current budget and the latest observed state, i.e. exactly what
+        _apply_action will check when the action arrives.
+        """
+        if self.tracker is None or self.prev_state is None:
+            return np.ones(sum(dl.ACTION_NVEC), dtype=bool)
+        return dl.action_mask(self.tracker.budget, self.prev_state)
+
     def _get_obs(self, state):
-        obs = []
-        survivors = state["survivors"]
-        for i in range(4):
-            if i < len(survivors):
-                s = survivors[i]
-                obs.extend([s["health"], s["temp_health"], s["x"], s["y"], s["z"], s["ammo"]])
-            else:
-                obs.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        obs.append(float(state["special_count"]))
-        return np.array(obs, dtype=np.float32)
+        elapsed_frac = min(1.0, (state["time"] - self.start_time) / EPISODE_MAX_TIME)
+        return self.tracker.observation(state, elapsed_frac)
 
     def _server_alive(self):
         return self.server is not None and self.server.poll() is None
@@ -260,15 +272,28 @@ class L4D2DirectorEnv(gym.Env):
                 time.sleep(1)
         raise RuntimeError(f"RCON command '{command}' failed after {attempts} attempts")
 
-    def _apply_action(self, client, action):
-        params = {
-            "SmokerLimit": int(action[0]),
-            "HunterLimit": int(action[1]),
-            "BoomerLimit": int(action[2]),
-            "MaxSpecials": int(action[3])
-        }
-        overwrite = ";".join(f"{k}={v}" for k, v in params.items())
-        self._send_rcon(f'sm_cvar l4d2_directoroptions_overwrite "{overwrite}"')
+    def _apply_action(self, action, state):
+        """Apply [si_level, common_level, event]. Returns (event_fired, invalid_event)."""
+        si_level, common_level, event = (int(a) for a in action)
+
+        overwrite = dl.director_overwrite(si_level, common_level)
+        if overwrite != self.last_overwrite:  # only resend when the pressure levels change
+            self._send_rcon(f'sm_cvar l4d2_directoroptions_overwrite "{overwrite}"')
+            self.last_overwrite = overwrite
+
+        if event == dl.EVENT_NONE:
+            return False, False
+        allowed, _reason = dl.event_allowed(event, self.tracker.budget, state)
+        if not allowed:
+            return False, True
+
+        reply = self._send_rcon(dl.EVENT_COMMANDS[event]) or ""
+        m = re.search(r"spawned (\d+)/", reply)
+        if m and int(m.group(1)) == 0:
+            return False, False  # no valid spawn spot: not the agent's fault, no charge
+        self.tracker.budget -= dl.EVENT_COSTS[event]
+        self.tracker.stats["events"][dl.EVENT_NAMES[event]] += 1
+        return True, False
 
     def _wait_for_survivors(self, deadline):
         """Poll the state file until TARGET_SURVIVORS (or a stable MIN_SURVIVORS) are present."""
@@ -338,7 +363,7 @@ class L4D2DirectorEnv(gym.Env):
                 self.stuck_counter = 0
 
         if self.stuck_counter >= STUCK_STEPS or time_frozen:
-            print("[Env] 🚨 BOTS ARE STUCK OR SERVER FROZEN.")
+            print("[Env] !! Bots stuck or server frozen; nudging L4B2 lead.")
             self._send_rcon("scripted_user_func l4b,bots,lead")
             self.stuck_counter = 0
 
@@ -427,6 +452,8 @@ class L4D2DirectorEnv(gym.Env):
         self.start_time = state["time"]
         self.wall_start = time.monotonic()
         self.prev_state = state
+        self.tracker = dl.DirectorTracker(max_steps=MAX_STEPS)
+        self.last_overwrite = None
         print(f"[Env] Reset complete in {time.monotonic() - wall:.1f}s. Episode starting at {TIMESCALE:g}x!")
         return self._get_obs(state), {}
 
@@ -435,62 +462,60 @@ class L4D2DirectorEnv(gym.Env):
         # Server failures end the episode (truncated) instead of crashing training;
         # the next reset() reboots srcds.
         try:
-            self._apply_action(self.client, action)
+            event_fired, invalid_event = self._apply_action(action, self.prev_state)
             state = self.reader.wait_until(self.prev_state["time"] + DECISION_INTERVAL)
         except (TimeoutError, RuntimeError) as e:
             print(f"[Env] Server problem mid-episode ({e}); truncating episode.")
-            return self._get_obs(self.prev_state), 0.0, False, True, {"error": str(e)}
+            info = {"error": str(e), "episode_stats": self.tracker.summary()}
+            return self._get_obs(self.prev_state), 0.0, False, True, info
+
+        # Map completed: survivors reached the end saferoom, or the server already moved on
+        # (game time went backwards / different map). Checked before the tracker update so a
+        # reloaded map's fresh survivors aren't diffed against the old ones.
+        map_changed = state["time"] < self.prev_state["time"] or (state["map"] and state["map"] != LAUNCH_MAP)
+        if map_changed:
+            state = self.prev_state  # last state from the finished map
+
+        _, incaps, deaths = self.tracker.update(self.prev_state, state, action, event_fired, invalid_event)
 
         elapsed = state["time"] - self.start_time
+        alive = sum(1 for s in state["survivors"] if s["alive"])
+        standing = sum(1 for s in state["survivors"] if s["alive"] and not s["incap"])
+        if map_changed:
+            # The map reloaded by itself: either the team finished (end saferoom -> next map)
+            # or everyone went down and L4D2 restarted the mission.
+            completed = state["progress"] >= MAP_CHANGE_COMPLETE_PROGRESS
+            wiped = not completed
+        else:
+            wiped = standing == 0  # all survivors down = mission lost in L4D2
+            completed = state["progress"] >= PROGRESS_COMPLETE and not wiped
 
-        survivors = state["survivors"]
-        prev_survivors = self.prev_state["survivors"]
+        reward, terms = dl.compute_reward(self.tracker.intensity, incaps, deaths, invalid_event,
+                                          wiped, completed, alive)
 
-        alive = sum(1 for s in survivors if s["alive"])
-        survival_reward = 0.5 * alive
-
-        damage = 0.0
-        for c, p in zip(survivors, prev_survivors):
-            if c["health"] >= 0 and p["health"] >= 0:
-                damage += max(0.0, p["health"] - c["health"])
-        damage_penalty = -0.02 * damage
-
-        specials = state["special_count"]
-        if specials == 0: tension = -0.1
-        elif specials <= 2: tension = 0.2
-        elif specials <= 4: tension = 0.0
-        else: tension = -0.5
-
-        time_bonus = 0.01 * min(elapsed, EPISODE_MAX_TIME) / 10.0
-        terminal_penalty = -10.0 if alive == 0 else 0.0
-
-        reward = survival_reward + damage_penalty + tension + time_bonus + terminal_penalty
-
-        terminated = bool(alive == 0)
-        truncated = bool(elapsed >= EPISODE_MAX_TIME)
-        
-        # Map completed: survivors reached the end saferoom, or the server already moved on
-        # (game time went backwards / different map).
-        game_time = state["time"]
-        map_changed = game_time < self.prev_state["time"] or (state["map"] and state["map"] != LAUNCH_MAP)
-        completed = state["progress"] >= PROGRESS_COMPLETE or map_changed
-        if completed and alive > 0:
-            print("[Env] Map completed! Bots survived the level. Terminating episode.")
-            terminated = True
-            reward += 100.0 # Big reward for completing the level!
+        terminated = wiped or completed
+        truncated = (not terminated) and (elapsed >= EPISODE_MAX_TIME or self.tracker.steps >= MAX_STEPS)
 
         progress = self._check_bot_movement(state)
-        total_ammo = sum(s["ammo"] for s in survivors)
-
         self.prev_state = state
         obs = self._get_obs(state)
         wall = time.monotonic() - self.wall_start
-        info = {"alive": alive, "specials": specials, "elapsed": elapsed, "wall": wall,
-                "progress": state["progress"], "completed": completed, "stuck_counter": self.stuck_counter}
+        info = {"alive": alive, "elapsed": elapsed, "wall": wall, "progress": progress,
+                "intensity": self.tracker.intensity, "budget": self.tracker.budget,
+                "completed": completed, "wiped": wiped, "reward_terms": terms}
+        if terminated or truncated:
+            info["episode_stats"] = {**self.tracker.summary(), "completed": completed, "wiped": wiped,
+                                     "alive_end": alive, "progress_end": progress, "game_seconds": elapsed}
+            outcome = "COMPLETED" if completed else "WIPED" if wiped else "TIME UP"
+            print(f"[Env] Episode over: {outcome} | {info['episode_stats']}")
 
-        print(f"[Step {elapsed:.0f}s game / {wall:.0f}s wall] Reward: {reward:.2f} | Alive: {alive} | Specials: {specials} | GameTime: {game_time:.0f}")
-        print(f"   -> Action taken: Smoker={action[0]} Hunter={action[1]} Boomer={action[2]} MaxSpecials={action[3]}")
-        print(f"   -> Progress: {progress:.1%} | Total Ammo: {total_ammo:.0f} | Stuck Counter: {self.stuck_counter}")
+        if self.verbose:
+            si, cl, ev = (int(a) for a in action)
+            print(f"[{elapsed:4.0f}s game/{wall:4.0f}s wall] r={reward:+.2f} I={self.tracker.intensity:.2f} "
+                  f"budget={self.tracker.budget:.0f} | SI{si} CL{cl} {dl.EVENT_NAMES[ev]}"
+                  f"{' (fired)' if event_fired else ' (invalid)' if invalid_event else ''} | "
+                  f"alive {alive} si {state['si_count']} tank {state['tank_count']} common {state['common_count']} "
+                  f"| prog {progress:.0%}")
 
         return obs, reward, terminated, truncated, info
 
@@ -498,24 +523,4 @@ class L4D2DirectorEnv(gym.Env):
         self._close_client()
         stop_server(self.server)
 
-# ============================================================
-# MAIN TRAINING LOOP
-# ============================================================
-
-if __name__ == "__main__":
-    print("Initializing L4D2 Environment...")
-    env = L4D2DirectorEnv()
-
-    print("Setting up PPO Model...")
-    model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_l4d2_tensorboard/")
-
-    print("Starting Training...")
-    try:
-        model.learn(total_timesteps=500, progress_bar=True)
-    except KeyboardInterrupt:
-        print("Training interrupted by user.")
-    finally:
-        print("Saving model...")
-        model.save("ppo_l4d2_director")
-        env.close()
-        print("Model saved as ppo_l4d2_director.zip")
+# Training lives in src/train.py:  python src/train.py --help
