@@ -10,6 +10,12 @@
  *       Teleports all living survivors to a nav area on the main path ~distance flow units ahead
  *       of the lead survivor and outside the start checkpoint. This trips the Director's
  *       "survivor left safe area" logic (and Left 4 Bots 2's auto-lead) with no human client.
+ *
+ *   sm_rl_auto_spectate <0|1>   (cvar, default 0)
+ *       Demo mode. Every human client is kept on the spectator team (so the survivors stay
+ *       all-bot, exactly like training) and is put in first-person view of the lead survivor.
+ *       The view is only re-targeted when the current target stops being a living survivor,
+ *       so the spectator can still click to cycle between bots.
  */
 #pragma semicolon 1
 #pragma newdecls required
@@ -22,18 +28,82 @@ public Plugin myinfo = {
     name = "RL Director Tools",
     author = "RL Director Project",
     description = "Spawn/control helpers for the external RL Director",
-    version = "1.0",
+    version = "1.1",
     url = ""
 };
+
+#define TEAM_SPECTATOR 1
+#define TEAM_SURVIVOR 2
+#define OBS_MODE_IN_EYE 4
 
 static const char g_sClassNames[][] = {
     "", "smoker", "boomer", "hunter", "spitter", "jockey", "charger", "witch", "tank"
 };
 
+ConVar g_cvAutoSpectate;
+
 public void OnPluginStart()
 {
     RegAdminCmd("sm_rl_spawn", Command_Spawn, ADMFLAG_ROOT, "sm_rl_spawn <class> [count]");
     RegAdminCmd("sm_rl_leave_saferoom", Command_LeaveSaferoom, ADMFLAG_ROOT, "sm_rl_leave_saferoom [distance]");
+    g_cvAutoSpectate = CreateConVar("sm_rl_auto_spectate", "0",
+        "1 = keep human clients spectating the survivor bots (demo mode)", 0, true, 0.0, true, 1.0);
+}
+
+public void OnMapStart()
+{
+    // TIMER_FLAG_NO_MAPCHANGE timers are freed automatically on map change.
+    CreateTimer(1.0, Timer_Spectate, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+}
+
+bool IsLivingSurvivor(int client)
+{
+    return client > 0 && client <= MaxClients && IsClientInGame(client)
+        && GetClientTeam(client) == TEAM_SURVIVOR && IsPlayerAlive(client);
+}
+
+int PickSpectateTarget()
+{
+    int lead = L4D_GetHighestFlowSurvivor();
+    if (IsLivingSurvivor(lead))
+        return lead;
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsLivingSurvivor(i))
+            return i;
+    }
+    return -1;
+}
+
+public Action Timer_Spectate(Handle timer)
+{
+    if (!g_cvAutoSpectate.BoolValue)
+        return Plugin_Continue;
+
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsClientInGame(i) || IsFakeClient(i))
+            continue;
+
+        if (GetClientTeam(i) != TEAM_SPECTATOR)
+        {
+            // Coop puts joining humans onto the survivor team (taking over a bot);
+            // moving them to spectator hands the survivor back to the AI.
+            ChangeClientTeam(i, TEAM_SPECTATOR);
+            continue; // set the camera next tick, once the team change has settled
+        }
+
+        int current = GetEntPropEnt(i, Prop_Send, "m_hObserverTarget");
+        if (IsLivingSurvivor(current))
+            continue;
+
+        int target = PickSpectateTarget();
+        if (target == -1)
+            continue;
+        SetEntProp(i, Prop_Send, "m_iObserverMode", OBS_MODE_IN_EYE);
+        SetEntPropEnt(i, Prop_Send, "m_hObserverTarget", target);
+    }
+    return Plugin_Continue;
 }
 
 public Action Command_LeaveSaferoom(int client, int args)

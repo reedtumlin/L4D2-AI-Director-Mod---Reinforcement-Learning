@@ -41,7 +41,8 @@ EVENT_COMMANDS = {
     EVENT_WITCH: "sm_rl_spawn witch",
     EVENT_TANK: "sm_rl_spawn tank",
 }
-EVENT_COSTS = {EVENT_NONE: 0, EVENT_HORDE: 8, EVENT_WITCH: 6, EVENT_TANK: 40}
+EVENT_COSTS = {EVENT_NONE: 0, EVENT_HORDE: 8, EVENT_WITCH: 30, EVENT_TANK: 40}
+MAX_WITCHES_ALIVE = 2  # the vanilla Director places only a few per map; stop witch spam
 
 ACTION_NVEC = (len(SI_LEVELS), len(COMMON_LEVELS), len(EVENT_NAMES))
 
@@ -64,13 +65,15 @@ def director_overwrite(si_level, common_level):
 
 
 def event_allowed(event, budget, state):
-    """(allowed, reason). Tanks are capped at one alive at a time."""
+    """(allowed, reason). One Tank alive at a time, at most MAX_WITCHES_ALIVE witches."""
     if event == EVENT_NONE:
         return True, ""
     if budget < EVENT_COSTS[event]:
         return False, "unaffordable"
     if event == EVENT_TANK and state["tank_count"] > 0:
         return False, "tank_alive"
+    if event == EVENT_WITCH and state["witch_count"] >= MAX_WITCHES_ALIVE:
+        return False, "witch_cap"
     return True, ""
 
 

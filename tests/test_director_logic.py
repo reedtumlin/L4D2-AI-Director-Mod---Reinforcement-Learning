@@ -66,12 +66,16 @@ def test_currency_and_tank_cap():
 
 def test_action_mask_matches_event_rules():
     n_si, n_cl, n_ev = dl.ACTION_NVEC
-    m = dl.action_mask(budget=7, state=state())
+    m = dl.action_mask(budget=9, state=state())
     assert m.shape == (n_si + n_cl + n_ev,) and m.dtype == bool
     assert m[: n_si + n_cl].all()                       # pressure levels always allowed
-    assert list(m[n_si + n_cl:]) == [True, False, True, False]  # none, horde(8), witch(6), tank(40)
+    assert list(m[n_si + n_cl:]) == [True, True, False, False]  # none, horde(8), witch(30), tank(40)
+    m = dl.action_mask(budget=35, state=state())
+    assert list(m[n_si + n_cl:]) == [True, True, True, False]   # witch affordable, tank not
     m = dl.action_mask(budget=60, state=state(tank=1))
     assert list(m[n_si + n_cl:]) == [True, True, True, False]   # tank already alive
+    m = dl.action_mask(budget=60, state=state(witch=2))
+    assert list(m[n_si + n_cl:]) == [True, True, False, True]   # witch cap reached
     m = dl.action_mask(budget=0, state=state())
     assert list(m[n_si + n_cl:]) == [True, False, False, False]  # "none" is always available
 

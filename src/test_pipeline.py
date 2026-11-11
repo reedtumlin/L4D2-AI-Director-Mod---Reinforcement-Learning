@@ -208,9 +208,17 @@ class StateReader:
 class L4D2DirectorEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=True, timescale=TIMESCALE, vanilla=False):
+        """
+        verbose:   print one line per decision step.
+        timescale: host_timescale during episodes (8 for training, 1 for watchable demos).
+        vanilla:   don't touch the Director at all (no overrides, no events). The agent's
+                   actions are ignored; used as the baseline for demos and evaluation.
+        """
         super().__init__()
         self.verbose = verbose
+        self.timescale = float(timescale)
+        self.vanilla = vanilla
         # [SI pressure 0-4, common pressure 0-3, event none/horde/witch/tank] -- see director_logic.py
         self.action_space = spaces.MultiDiscrete(dl.ACTION_NVEC)
         self.observation_space = spaces.Box(low=-1.0, high=1.5, shape=(dl.OBS_SIZE,), dtype=np.float32)
@@ -447,14 +455,14 @@ class L4D2DirectorEnv(gym.Env):
         # Clear the previous episode's Director overrides so every episode starts from vanilla.
         self._send_rcon('sm_cvar l4d2_directoroptions_overwrite ""')
         state = self._spawn_bots()
-        self._send_rcon(f"host_timescale {TIMESCALE}")
+        self._send_rcon(f"host_timescale {self.timescale:g}")
 
         self.start_time = state["time"]
         self.wall_start = time.monotonic()
         self.prev_state = state
         self.tracker = dl.DirectorTracker(max_steps=MAX_STEPS)
         self.last_overwrite = None
-        print(f"[Env] Reset complete in {time.monotonic() - wall:.1f}s. Episode starting at {TIMESCALE:g}x!")
+        print(f"[Env] Reset complete in {time.monotonic() - wall:.1f}s. Episode starting at {self.timescale:g}x{' (VANILLA Director)' if self.vanilla else ''}!")
         return self._get_obs(state), {}
 
     def step(self, action):
@@ -462,7 +470,10 @@ class L4D2DirectorEnv(gym.Env):
         # Server failures end the episode (truncated) instead of crashing training;
         # the next reset() reboots srcds.
         try:
-            event_fired, invalid_event = self._apply_action(action, self.prev_state)
+            if self.vanilla:
+                event_fired, invalid_event = False, False
+            else:
+                event_fired, invalid_event = self._apply_action(action, self.prev_state)
             state = self.reader.wait_until(self.prev_state["time"] + DECISION_INTERVAL)
         except (TimeoutError, RuntimeError) as e:
             print(f"[Env] Server problem mid-episode ({e}); truncating episode.")
@@ -502,7 +513,8 @@ class L4D2DirectorEnv(gym.Env):
         wall = time.monotonic() - self.wall_start
         info = {"alive": alive, "elapsed": elapsed, "wall": wall, "progress": progress,
                 "intensity": self.tracker.intensity, "budget": self.tracker.budget,
-                "completed": completed, "wiped": wiped, "reward_terms": terms}
+                "completed": completed, "wiped": wiped, "reward_terms": terms,
+                "event_fired": event_fired, "invalid_event": invalid_event}
         if terminated or truncated:
             info["episode_stats"] = {**self.tracker.summary(), "completed": completed, "wiped": wiped,
                                      "alive_end": alive, "progress_end": progress, "game_seconds": elapsed}
