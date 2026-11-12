@@ -1,4 +1,4 @@
-# Python 3.13. Install with:  python -m pip install -r requirements.txt
+# Python 3.13. 
 gymnasium==1.4.0
 numpy==2.5.4
 rcon==2.4.9

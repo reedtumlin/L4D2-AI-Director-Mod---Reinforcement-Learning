@@ -151,7 +151,7 @@ WIPE_PENALTY = 20.0
 COMPLETE_BONUS = 10.0
 COMPLETE_BONUS_PER_ALIVE = 2.5
 
-
+#Computes the Base score per step
 def band_reward(intensity):
     """+1 inside [TARGET_LOW, TARGET_HIGH], linear fall-off outside it."""
     if intensity < TARGET_LOW:
@@ -162,7 +162,7 @@ def band_reward(intensity):
         return BAND_REWARD - slope * (intensity - TARGET_HIGH)
     return BAND_REWARD
 
-
+#Takes the base band_reward and applies penalties for incaps, deaths, invalid events, wipes, and bonuses for completing the level
 def compute_reward(intensity, incaps, deaths, invalid_event, wiped, completed, alive):
     terms = {
         "band": band_reward(intensity),
