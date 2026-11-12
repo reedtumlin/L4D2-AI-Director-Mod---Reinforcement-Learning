@@ -241,7 +241,7 @@ class DirectorTracker:
             "invalid_events": st["invalid_events"],
             **{f"events_{k}": v for k, v in st["events"].items()},
         }
-
+    # Pulls observation data from the game when it's running to reward/punish the agent, and give the director info to make decisions.
     def observation(self, state, elapsed_frac):
         survivors = state["survivors"]
         alive = [s for s in survivors if s["alive"]]

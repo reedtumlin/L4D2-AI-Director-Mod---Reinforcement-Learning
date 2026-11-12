@@ -13,9 +13,16 @@
  *
  *   sm_rl_auto_spectate <0|1>   (cvar, default 0)
  *       Demo mode. Every human client is kept on the spectator team (so the survivors stay
- *       all-bot, exactly like training) and is put in first-person view of the lead survivor.
+ *       all-bot, exactly like training) and follows the lead survivor in third person
+ *       (sm_rl_spectate_mode 5, default) or first person (sm_rl_spectate_mode 4).
  *       The view is only re-targeted when the current target stops being a living survivor,
- *       so the spectator can still click to cycle between bots.
+ *       so the spectator can still click to cycle between bots. The camera is set through the
+ *       engine's spec_mode command and re-synced every second if the server-side view drifts.
+ *
+ *   sm_rl_specinfo
+ *       Debug: prints each human spectator's server-side observer mode, target, movetype and
+ *       position. "dist" should stay near 0 while spectating; a large value means the server
+ *       is culling the world from somewhere other than where the camera is.
  */
 #pragma semicolon 1
 #pragma newdecls required
@@ -28,19 +35,23 @@ public Plugin myinfo = {
     name = "RL Director Tools",
     author = "RL Director Project",
     description = "Spawn/control helpers for the external RL Director",
-    version = "1.1",
+    version = "1.2",
     url = ""
 };
 
 #define TEAM_SPECTATOR 1
 #define TEAM_SURVIVOR 2
 #define OBS_MODE_IN_EYE 4
+#define OBS_MODE_CHASE 5
 
 static const char g_sClassNames[][] = {
     "", "smoker", "boomer", "hunter", "spitter", "jockey", "charger", "witch", "tank"
 };
 
+#define SPEC_MAX_DRIFT 150.0
+
 ConVar g_cvAutoSpectate;
+ConVar g_cvSpectateMode;
 
 public void OnPluginStart()
 {
@@ -48,6 +59,34 @@ public void OnPluginStart()
     RegAdminCmd("sm_rl_leave_saferoom", Command_LeaveSaferoom, ADMFLAG_ROOT, "sm_rl_leave_saferoom [distance]");
     g_cvAutoSpectate = CreateConVar("sm_rl_auto_spectate", "0",
         "1 = keep human clients spectating the survivor bots (demo mode)", 0, true, 0.0, true, 1.0);
+    g_cvSpectateMode = CreateConVar("sm_rl_spectate_mode", "5",
+        "Demo camera: 5 = third person (chase), 4 = first person", 0, true, 4.0, true, 5.0);
+    RegAdminCmd("sm_rl_specinfo", Command_SpecInfo, ADMFLAG_ROOT, "Print each spectator's server-side view state");
+}
+
+public Action Command_SpecInfo(int client, int args)
+{
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsClientInGame(i) || IsFakeClient(i))
+            continue;
+        float org[3], eye[3], tEye[3];
+        GetClientAbsOrigin(i, org);
+        GetClientEyePosition(i, eye);
+        int mode = GetEntProp(i, Prop_Send, "m_iObserverMode");
+        int target = GetEntPropEnt(i, Prop_Send, "m_hObserverTarget");
+        int mt = view_as<int>(GetEntityMoveType(i));
+        float dist = -1.0;
+        if (target > 0 && target <= MaxClients && IsClientInGame(target))
+        {
+            GetClientEyePosition(target, tEye);
+            dist = GetVectorDistance(eye, tEye);
+        }
+        ReplyToCommand(client, "[RL] spec %d team=%d mode=%d target=%d movetype=%d eye=(%.0f %.0f %.0f) org=(%.0f %.0f %.0f) target_eye=(%.0f %.0f %.0f) dist=%.0f viewent=%d",
+            i, GetClientTeam(i), mode, target, mt, eye[0], eye[1], eye[2], org[0], org[1], org[2],
+            tEye[0], tEye[1], tEye[2], dist, GetEntPropEnt(i, Prop_Data, "m_hViewEntity"));
+    }
+    return Plugin_Handled;
 }
 
 public void OnMapStart()
@@ -94,16 +133,41 @@ public Action Timer_Spectate(Handle timer)
         }
 
         int current = GetEntPropEnt(i, Prop_Send, "m_hObserverTarget");
-        if (IsLivingSurvivor(current))
-            continue;
+        if (IsLivingSurvivor(current) && SpectatorInSync(i, current))
+            continue; // healthy; also leaves a bot the viewer picked by clicking alone
 
-        int target = PickSpectateTarget();
+        int target = IsLivingSurvivor(current) ? current : PickSpectateTarget();
         if (target == -1)
             continue;
-        SetEntProp(i, Prop_Send, "m_iObserverMode", OBS_MODE_IN_EYE);
-        SetEntPropEnt(i, Prop_Send, "m_hObserverTarget", target);
+
+        // Go through the engine's own spectator commands instead of writing the observer
+        // netprops directly. Writing m_iObserverMode only changes what the client draws: the
+        // server keeps the spectator as a walking player parked where they joined, so it
+        // culls entities and closes area portals from that spot (invisible infected, "void"
+        // rooms). spec_mode runs CBasePlayer::SetObserverMode, which switches the server to
+        // MOVETYPE_OBSERVER so the spectator's server-side position follows the target.
+        FakeClientCommand(i, "spec_mode %d", g_cvSpectateMode.IntValue);
+        if (GetEntPropEnt(i, Prop_Send, "m_hObserverTarget") != target)
+            SetEntPropEnt(i, Prop_Send, "m_hObserverTarget", target);
     }
     return Plugin_Continue;
+}
+
+// True when the server-side observer state matches what the viewer sees: a first- or third-person
+// view of the target, observer movetype, and a server-side position on top of the target (that
+// position decides which entities and areas get networked to the viewer). Either camera mode
+// counts as in sync, so the viewer can still press Space to switch between them.
+bool SpectatorInSync(int client, int target)
+{
+    int mode = GetEntProp(client, Prop_Send, "m_iObserverMode");
+    if (mode != OBS_MODE_IN_EYE && mode != OBS_MODE_CHASE)
+        return false;
+    if (GetEntityMoveType(client) != MOVETYPE_OBSERVER)
+        return false;
+    float a[3], b[3];
+    GetClientAbsOrigin(client, a);
+    GetClientAbsOrigin(target, b);
+    return GetVectorDistance(a, b) <= SPEC_MAX_DRIFT;
 }
 
 public Action Command_LeaveSaferoom(int client, int args)

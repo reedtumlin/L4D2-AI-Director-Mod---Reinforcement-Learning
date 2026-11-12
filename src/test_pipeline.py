@@ -286,7 +286,9 @@ class L4D2DirectorEnv(gym.Env):
 
         overwrite = dl.director_overwrite(si_level, common_level)
         if overwrite != self.last_overwrite:  # only resend when the pressure levels change
-            self._send_rcon(f'sm_cvar l4d2_directoroptions_overwrite "{overwrite}"')
+            # Set the cvar directly, not via sm_cvar: sm_cvar prints "[SM] ADMIN: Changed cvar"
+            # to every client's chat, which clutters the demo/spectator view.
+            self._send_rcon(f'l4d2_directoroptions_overwrite "{overwrite}"')
             self.last_overwrite = overwrite
 
         if event == dl.EVENT_NONE:
@@ -453,7 +455,7 @@ class L4D2DirectorEnv(gym.Env):
             self._boot_server()
 
         # Clear the previous episode's Director overrides so every episode starts from vanilla.
-        self._send_rcon('sm_cvar l4d2_directoroptions_overwrite ""')
+        self._send_rcon('l4d2_directoroptions_overwrite ""')
         state = self._spawn_bots()
         self._send_rcon(f"host_timescale {self.timescale:g}")
 

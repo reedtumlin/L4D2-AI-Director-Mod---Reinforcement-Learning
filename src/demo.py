@@ -9,8 +9,9 @@ Prototype demo: watch the survivor bots play under the trained RL Director.
 What happens:
   1. The dedicated server boots and the 4 survivor bots leave the saferoom (same as training).
   2. The L4D2 client is launched and connects (accept the -insecure / VAC popup if shown).
-  3. rl_director_tools keeps you on the spectator team, in first-person view of the lead bot.
-     Click to cycle between bots; if your bot dies the view jumps to a living one.
+  3. rl_director_tools keeps you on the spectator team, following the lead bot in third person
+     (--first-person to watch through the bot's eyes). Click to cycle between bots,
+     Space to switch camera mode; if your bot dies the view jumps to a living one.
   4. Every 5 game-seconds the trained policy picks [SI pressure, common pressure, event].
      Events (horde / witch / tank) and periodic status are announced in the in-game chat.
   5. When the map is completed or the team wipes, the map reloads and a new run starts.
@@ -18,6 +19,11 @@ What happens:
 
 Runs at 1x speed by default so it looks like normal play. The policy is time-scale
 independent (all its timing is in game seconds), so a model trained at 8x behaves the same.
+
+Recording: capture the game window with Win+Alt+R (Xbox Game Bar) or OBS. Use --no-chat to
+keep the Director announcements out of the footage.
+If infected look invisible or rooms render as empty "void" while spectating, run
+`sm_rl_specinfo` over RCON: "dist" should stay near 0 (see rl_director_tools.sp).
 """
 
 import argparse
@@ -120,6 +126,7 @@ def main():
     ap.add_argument("--no-client", action="store_true", help="don't launch the L4D2 client")
     ap.add_argument("--connect", default=None, help="IP for the client to connect to (default: LAN IP)")
     ap.add_argument("--no-chat", action="store_true", help="don't post Director decisions to in-game chat")
+    ap.add_argument("--first-person", action="store_true", help="spectate through the bot's eyes (default: third person)")
     args = ap.parse_args()
 
     model = None
@@ -134,6 +141,7 @@ def main():
     episode = 0
     try:
         obs, _ = env.reset()
+        env._send_rcon(f"sm_rl_spectate_mode {4 if args.first_person else 5}")
         env._send_rcon("sm_rl_auto_spectate 1")
         if not args.no_client:
             launch_client(args.connect or lan_ip())
